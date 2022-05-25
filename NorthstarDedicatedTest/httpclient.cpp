@@ -3,22 +3,36 @@
 
 #include "squirrel.h"
 #include <iostream>
+#include <optional>
+#include <utility>
 
-// Haven't implemented status codes and headers yet.
+
 struct HTTPResponse
 {
-	const char* body;
+	//long status;
+	//std::vector<const char*> headers;
+	std::string body;
 };
+
+
+struct HTTPRequestData
+{
+	const std::string url;
+	const std::string method;
+	const std::string body;
+};
+
 
 struct HTTPRequest
 {
 	int id;
-	const char* url;
-	const char* method;
-	const char* body;
-	bool resolved = false;
-	HTTPResponse response;
+	std::optional<HTTPResponse> response;
 };
+
+
+int lastID = 0;
+
+std::vector<HTTPRequest*> requests;
 
 void SetCommonHttpClientOptions(CURL* curl)
 {
@@ -26,138 +40,145 @@ void SetCommonHttpClientOptions(CURL* curl)
 	curl_easy_setopt(curl, CURLOPT_VERBOSE, 1L);
 }
 
+// i don't know actual what this stuff do
 size_t CurlWriteToStringBufferCallbackLocal(char* contents, size_t size, size_t nmemb, void* userp)
 {
 	((std::string*)userp)->append((char*)contents, size * nmemb);
 	return size * nmemb;
 }
 
-char* MakePost(const char* url, const char* body)
+
+HTTPResponse MakeRequestSync(const HTTPRequestData data)
 {
 	CURL* curl = curl_easy_init();
 
 	std::string readBuffer;
-
-	curl_easy_setopt(
-		curl,
-		CURLOPT_URL,
-		url
-		);
-	curl_easy_setopt(curl, CURLOPT_CUSTOMREQUEST, "POST");
+	long http_code;
+	curl_easy_setopt(curl, CURLOPT_URL, data.url.c_str());
+	curl_easy_setopt(curl, CURLOPT_CUSTOMREQUEST, data.method.c_str());
 	curl_easy_setopt(curl, CURLOPT_WRITEFUNCTION, CurlWriteToStringBufferCallbackLocal);
 	curl_easy_setopt(curl, CURLOPT_WRITEDATA, &readBuffer);
-	curl_easy_setopt(curl, CURLOPT_POSTFIELDS, body);
+	curl_easy_setopt(curl, CURLOPT_POSTFIELDS, data.body.c_str());
+	curl_easy_getinfo(curl, CURLINFO_RESPONSE_CODE, &http_code);
+
 	SetCommonHttpClientOptions(curl);
 
 	CURLcode res = curl_easy_perform(curl);
 
 	if (res != CURLE_OK)
-		fprintf(
-			stderr, "curl_easy_perform() failed: %s\n",
-			curl_easy_strerror(res)
-			);
+		fprintf(stderr, "curl_easy_perform() failed: %s\n", curl_easy_strerror(res));
 
 	curl_easy_cleanup(curl);
 
-
-
-	char* writable = new char[readBuffer.size() + 1];
-	std::copy(readBuffer.begin(), readBuffer.end(), writable);
-	writable[readBuffer.size()] = '\0';
-
-	response.body = writable;
-	requests[reqIndex].resolved = true;
-	requests[reqIndex].response = response;
+	return HTTPResponse{readBuffer};
 }
 
-HTTPRequest* GetRequestByID(int id)
-{
-	for (auto r : requests)
-	{
-		if (r.id == id)
-			return &r;
-	}
-	return nullptr;
-}
-
-SQRESULT SQ_SendHTTPRequest(void* sqvm)
+HTTPRequestData ParseSquirrelInput(void* sqvm)
 {
 	const char* url = ServerSq_getstring(sqvm, 1);
 	const char* method = ServerSq_getstring(sqvm, 2);
 	const char* body = ServerSq_getstring(sqvm, 3);
 
-	HTTPRequest request;
-	request.id = lastID;
-	request.url = url;
-	request.method = method;
-	request.body = body;
+	return HTTPRequestData{url, method, body};
+}
 
+int GetRequestIndexById(int id)
+{
+	for (int i = 0; i < requests.size(); i++)
+	{
+		if (requests[i]->id == id)
+			return i;
+	}
+	return -1;
+}
+
+HTTPRequest* GetRequestByID(int id)
+{
+	for (HTTPRequest* r : requests)
+	{
+		if (r->id == id)
+			return r;
+	}
+	return nullptr;
+}
+
+void MakeTrackingRequestThread(HTTPRequestData data, HTTPRequest* requestPointer)
+{
+	HTTPResponse responsePointer = MakeRequestSync(std::move(data));
+	requestPointer->response = responsePointer;
+}
+
+SQRESULT SQ_SendHTTPRequestTracking(void* sqvm)
+{
+	HTTPRequestData data = ParseSquirrelInput(sqvm);
+
+	int currentID = lastID++;
+
+	HTTPRequest* request = new HTTPRequest{currentID, std::nullopt};
 	requests.push_back(request);
-	std::thread requestThread(MakeRequest, url, method, body, lastID);
+	std::thread requestThread(MakeTrackingRequestThread, data, request);
 	requestThread.detach();
-	ServerSq_pushinteger(sqvm, lastID);
 
-	lastID++;
+	ServerSq_pushinteger(sqvm, currentID);
+
 	return SQRESULT_NOTNULL;
 }
 
-// bool function NSHTTPIsResolved( int reqID )
-SQRESULT SQ_IsResolved(void* sqvm)
+SQRESULT SQ_SendHTTPRequestNoTracking(void* sqvm)
 {
-	int reqID = ServerSq_getinteger(sqvm, 1);
-	HTTPRequest* request = GetRequestByID(reqID);
-	if (request == nullptr || !request->response.body)
-	{
-		ServerSq_pusherror(sqvm, fmt::format("No request with ID {} exists or request isn't resolved", reqID).c_str());
-		return SQRESULT_ERROR;
-	}
-	else
-		ServerSq_pushbool(sqvm, request->resolved);
-	return SQRESULT_NOTNULL;
-}
+	HTTPRequestData data = ParseSquirrelInput(sqvm);
 
-// string function NSGetResponseBody( int reqID )
-SQRESULT SQ_GetResponseBody(void* sqvm)
-{
-	int reqID = ServerSq_getinteger(sqvm, 1);
-	HTTPRequest* request = GetRequestByID(reqID);
-	if (request == nullptr || !request->response.body)
-	{
-		ServerSq_pusherror(sqvm, fmt::format("No request with ID {} exists or request isn't resolved", reqID).c_str());
-		return SQRESULT_ERROR;
-	}
-	else
-		ServerSq_pushstring(sqvm, request->response.body, -1);
-	return SQRESULT_NOTNULL;
-}
+	std::thread requestThread(MakeRequestSync, data);
+	requestThread.detach();
 
-// void function NSRemoveRequest( int reqID )
-SQRESULT SQ_RemoveRequest(void* sqvm)
-{
-	int reqID = ServerSq_getinteger(sqvm, 1);
-	HTTPRequest* request = GetRequestByID(reqID);
-	if (request == nullptr)
-	{
-		ServerSq_pusherror(sqvm, fmt::format("No request with ID {} exists", reqID).c_str());
-		return SQRESULT_ERROR;
-	}
-	else
-	{
-		int i = 0;
-		for (auto r : requests)
-			if (r.id == reqID)
-			{
-				requests.erase(requests.begin() + i);
-				break;
-			}
-	}
 	return SQRESULT_NULL;
 }
+
+
+SQRESULT SQ_GetResponseIfComplete(void* sqvm)
+{
+	int reqID = ServerSq_getinteger(sqvm, 1);
+	int requestIndex = GetRequestIndexById(reqID);
+	if (requestIndex == -1)
+	{
+		ServerSq_pusherror(sqvm, fmt::format("No request with ID {} exists or request already received", reqID).c_str());
+		return SQRESULT_ERROR;
+	}
+	else
+	{
+		SQRESULT result;
+		auto response = requests[requestIndex];
+		spdlog::info("response id: {}", response->id);
+
+		if (response->response.has_value())
+		{
+			std::string string = response->response.value().body;
+
+			char* writable = new char[string.size() + 1];
+			std::copy(string.begin(), string.end(), writable);
+			writable[string.size()] = '\0';
+
+			ServerSq_pushstring(sqvm, writable, -1);
+			result = SQRESULT_NOTNULL;
+
+			requests.erase(requests.begin() + requestIndex);
+			delete response;
+		}
+		else
+		{
+			result = SQRESULT_NULL;
+		}
+		return result;
+	}
+}
+
 void InitialiseHttpClient(HMODULE baseAddress)
 {
-	g_ServerSquirrelManager->AddFuncRegistration("int", "NSHTTPRequest", "string url, string method, string body", "", SQ_SendHTTPRequest);
-	g_ServerSquirrelManager->AddFuncRegistration("string", "NSGetResponseBody", "int reqID", "", SQ_GetResponseBody);
-	//g_ServerSquirrelManager->AddFuncRegistration("int", "NSGetResponseStatus", "int index", "", SQ_GetResponseCode);
-	g_ServerSquirrelManager->AddFuncRegistration("bool", "NSHTTPIsResolved", "int reqID", "", SQ_IsResolved);
-	g_ServerSquirrelManager->AddFuncRegistration("void", "NSRemoveRequest", "int reqID", "", SQ_RemoveRequest);
+	// Request with a response
+	g_ServerSquirrelManager->AddFuncRegistration(
+		"int", "NSHTTPRequestTracking", "string url, string method, string body", "", SQ_SendHTTPRequestTracking);
+	// Request to send and forget
+	g_ServerSquirrelManager->AddFuncRegistration(
+		"int", "NSHTTPRequest", "string url, string method, string body", "", SQ_SendHTTPRequestNoTracking);
+	g_ServerSquirrelManager->AddFuncRegistration("string", "NSGetResponseIfComplete", "int reqID", "", SQ_GetResponseIfComplete);
 }
