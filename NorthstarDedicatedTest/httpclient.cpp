@@ -38,6 +38,13 @@ void SetCommonHttpClientOptions(CURL* curl)
 {
 	curl_easy_setopt(curl, CURLOPT_IPRESOLVE, CURL_IPRESOLVE_V4);
 	curl_easy_setopt(curl, CURLOPT_VERBOSE, 1L);
+
+
+	struct curl_slist* headers = NULL;
+	headers = curl_slist_append(headers, "Accept: application/json");
+	headers = curl_slist_append(headers, "Content-Type: application/json");
+	headers = curl_slist_append(headers, "charset: utf-8");
+	curl_easy_setopt(curl, CURLOPT_HTTPHEADER, headers);
 }
 
 // i don't know actual what this stuff do
